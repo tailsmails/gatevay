@@ -71,8 +71,111 @@ fn copy_data(mut src net.TcpConn, mut dst net.TcpConn) {
 		if n == 0 { break }
 		dst.write(buf[..n]) or { break }
 	}
-	src.close() or {}
-	dst.close() or {}
+	C.close(src_fd)
+	C.close(dst_fd)
+	println('Copy [${name}] -> Closed')
+	ch <- true
+}
+
+fn my_htons(n u16) u16 {
+	return ((n & 0xff) << 8) | ((n & 0xff00) >> 8)
+}
+
+fn get_interface_name(ip string) string {
+	res := os.execute('ip -o addr show')
+	if res.exit_code != 0 {
+		if ip.starts_with('192.168.') {
+			return 'wlan0'
+		}
+		return 'ccmni0'
+	}
+	for line in res.output.split_into_lines() {
+		if line.contains(' ${ip}/') || line.contains(' ${ip} ') {
+			parts := line.split(' ')
+			mut clean_parts := []string{}
+			for p in parts {
+				trimmed := p.trim_space()
+				if trimmed != '' {
+					clean_parts << trimmed
+				}
+			}
+			if clean_parts.len >= 2 {
+				return clean_parts[1].trim_space()
+			}
+		}
+	}
+	if ip.starts_with('192.168.') {
+		return 'wlan0'
+	}
+	return 'ccmni0'
+}
+
+fn get_default_interface() string {
+	res := os.execute('ip route show')
+	if res.exit_code != 0 {
+		return 'wlan0'
+	}
+	for line in res.output.split_into_lines() {
+		if line.starts_with('default ') {
+			parts := line.split(' ')
+			for i, part in parts {
+				if part == 'dev' && i + 1 < parts.len {
+					return parts[i+1].trim_space()
+				}
+			}
+		}
+	}
+	return 'wlan0'
+}
+
+fn find_native_table(ifname string) string {
+	mut res := os.execute('ip route show table all')
+	if res.exit_code != 0 {
+		res = os.execute('ip route show table 0')
+		if res.exit_code != 0 {
+			return ''
+		}
+	}
+	for line in res.output.split_into_lines() {
+		if line.contains('dev ${ifname}') {
+			parts := line.split(' ')
+			for i, part in parts {
+				if part == 'table' && i + 1 < parts.len {
+					return parts[i+1].trim_space()
+				}
+			}
+		}
+	}
+	return ''
+}
+
+fn setup_routing(ip string) {
+	ifname := get_interface_name(ip)
+	default_ifname := get_default_interface()
+
+	if ifname == default_ifname {
+		table_id := if ifname == 'wlan0' { 101 } else { 100 }
+		os.execute('ip rule del from ${ip} table ${table_id} 2>/dev/null')
+		os.execute('ip route flush table ${table_id} 2>/dev/null')
+		println('Using default system routing for primary interface [${ifname}]: [${ip}]')
+		return
+	}
+
+	mut table_id := find_native_table(ifname)
+	if table_id == '' {
+		table_id = '100'
+		os.execute('ip route flush table 100 2>/dev/null')
+		os.execute('ip route add default dev ${ifname} table 100')
+	}
+
+	priority := 50
+
+	os.execute('ip rule del from ${ip} table ${table_id} 2>/dev/null')
+	os.execute('ip rule del from ${ip} priority ${priority} 2>/dev/null')
+
+	os.execute('ip rule add from ${ip} table ${table_id} priority ${priority}')
+
+	println('Routing auto-configured for secondary interface: [${ip}] -> dev [${ifname}] (table ${table_id})')
 }
 
 fn dial_with_bind_safe(host string, port u16, bind_ip string) !&net.TcpConn {
