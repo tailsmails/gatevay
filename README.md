@@ -13,14 +13,6 @@ A lightweight, multi-gateway SOCKS5 proxy tool written in V. It routes outbound 
 
 ---
 
-## Quick Install
-
-```sh
-apt update -y && apt install -y git clang make && if ! command -v v >/dev/null 2>&1; then git clone --depth=1 https://github.com/vlang/v && cd v && make && ./v symlink && cd ..; fi && git clone --depth=1 https://github.com/tailsmails/gatevay && cd gatevay && v -prod gatevay.v -o gatevay && ln -sf $(pwd)/gatevay $PREFIX/bin/gatevay
-```
-
----
-
 ## Usage
 
 Run the compiled binary by passing gateway IP and local port pairs:
