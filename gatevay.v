@@ -2,6 +2,36 @@ import net
 import os
 import time
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+
+struct C.in_addr {
+mut:
+	s_addr u32
+}
+
+struct C.sockaddr_in {
+mut:
+	sin_family u16
+	sin_port   u16
+	sin_addr   C.in_addr
+	sin_zero   [8]u8
+}
+
+fn C.socket(domain int, s_type int, protocol int) int
+fn C.setsockopt(sockfd int, level int, optname int, optval voidptr, optlen int) int
+fn C.bind(sockfd int, addr voidptr, addrlen int) int
+fn C.connect(sockfd int, addr voidptr, addrlen int) int
+fn C.close(sockfd int) int
+fn C.inet_pton(af int, src &char, dst voidptr) int
+fn C.strerror(errnum int) &char
+fn C.recv(sockfd int, buf voidptr, len int, flags int) int
+fn C.send(sockfd int, buf voidptr, len int, flags int) int
+
 struct Target {
 	bind_ip    string
 	local_port int
@@ -64,12 +94,37 @@ fn read_exact(mut conn net.TcpConn, mut buf []u8) ! {
 	}
 }
 
-fn copy_data(mut src net.TcpConn, mut dst net.TcpConn) {
+fn copy_data_thread(src_fd int, dst_fd int, name string, ch chan bool) {
 	mut buf := []u8{len: 8192}
 	for {
-		n := src.read(mut buf) or { break }
-		if n == 0 { break }
-		dst.write(buf[..n]) or { break }
+		n := C.recv(src_fd, buf.data, 8192, 0)
+		if n < 0 {
+			err_code := C.errno
+			err_str := unsafe { C.strerror(err_code).vstring() }
+			println('Copy [${name}] -> Read failed (errno ${err_code}: ${err_str})')
+			break
+		}
+		if n == 0 {
+			println('Copy [${name}] -> EOF reached')
+			break
+		}
+		mut total := 0
+		mut failed := false
+		for total < n {
+			sent := C.send(dst_fd, voidptr(u64(buf.data) + u64(total)), n - total, 0)
+			if sent < 0 {
+				err_code := C.errno
+				err_str := unsafe { C.strerror(err_code).vstring() }
+				println('Copy [${name}] -> Write failed (errno ${err_code}: ${err_str})')
+				failed = true
+				break
+			}
+			total += sent
+		}
+		if failed {
+			break
+		}
+		println('Copy [${name}] -> Transmitted ${n} bytes')
 	}
 	C.close(src_fd)
 	C.close(dst_fd)
@@ -179,30 +234,74 @@ fn setup_routing(ip string) {
 }
 
 fn dial_with_bind_safe(host string, port u16, bind_ip string) !&net.TcpConn {
-	is_ipv6_bind := bind_ip.contains(':')
-	family := if is_ipv6_bind { net.AddrFamily.ip6 } else { net.AddrFamily.ip }
-
-	local_bind := format_bind_addr(bind_ip, 0)
 	dest := format_dest_addr(host, port)
-
-	addrs := net.resolve_addrs(dest, family, .tcp) or {
-		return error('could not resolve ${dest} for family ${family}: ${err}')
+	println('Proxy [${bind_ip}] -> Resolving address for: ${dest}')
+	addrs := net.resolve_addrs(dest, .ip, .tcp) or {
+		return error('could not resolve ${dest}: ${err}')
 	}
-
 	if addrs.len == 0 {
 		return error('no addresses resolved for ${dest}')
 	}
 
-	mut err_msg := ''
-	for addr in addrs {
-		resolved_dest := addr.str()
-		mut target := net.dial_tcp_with_bind(resolved_dest, local_bind) or {
-			err_msg = err.msg()
-			continue
-		}
-		return target
+	remote_ip_str, remote_port := parse_addr_str(addrs[0].str())
+	println('Proxy [${bind_ip}] -> Resolved ${dest} to ${remote_ip_str}:${remote_port}')
+
+	sockfd := C.socket(2, 1, 0)
+	if sockfd < 0 {
+		err_code := C.errno
+		err_str := unsafe { C.strerror(err_code).vstring() }
+		return error('socket creation failed (errno ${err_code}: ${err_str})')
 	}
-	return error('dial_with_bind_safe failed for address ${dest}: ${err_msg}')
+
+	optval := 1
+	if C.setsockopt(sockfd, 1, 2, &optval, sizeof(int)) < 0 {
+		err_code := C.errno
+		err_str := unsafe { C.strerror(err_code).vstring() }
+		C.close(sockfd)
+		return error('setsockopt SO_REUSEADDR failed (errno ${err_code}: ${err_str})')
+	}
+
+	mut local_addr := C.sockaddr_in{}
+	local_addr.sin_family = 2
+	local_addr.sin_port = my_htons(0)
+	if C.inet_pton(2, bind_ip.str, &local_addr.sin_addr) <= 0 {
+		C.close(sockfd)
+		return error('invalid local bind IP: ${bind_ip}')
+	}
+
+	println('Proxy [${bind_ip}] -> Binding socket to local IP...')
+	if C.bind(sockfd, voidptr(&local_addr), sizeof(C.sockaddr_in)) < 0 {
+		err_code := C.errno
+		err_str := unsafe { C.strerror(err_code).vstring() }
+		C.close(sockfd)
+		return error('bind failed to ${bind_ip} (errno ${err_code}: ${err_str})')
+	}
+
+	mut remote_addr := C.sockaddr_in{}
+	remote_addr.sin_family = 2
+	remote_addr.sin_port = my_htons(remote_port)
+	if C.inet_pton(2, remote_ip_str.str, &remote_addr.sin_addr) <= 0 {
+		C.close(sockfd)
+		return error('invalid remote IP: ${remote_ip_str}')
+	}
+
+	println('Proxy [${bind_ip}] -> Connecting to ${remote_ip_str}:${remote_port}...')
+	if C.connect(sockfd, voidptr(&remote_addr), sizeof(C.sockaddr_in)) < 0 {
+		err_code := C.errno
+		err_str := unsafe { C.strerror(err_code).vstring() }
+		C.close(sockfd)
+		return error('connect failed to ${remote_ip_str}:${remote_port} from ${bind_ip} (errno ${err_code}: ${err_str})')
+	}
+
+	println('Proxy [${bind_ip}] -> Connected successfully to ${dest}!')
+	sock := net.TcpSocket{
+		handle: sockfd
+	}
+	return &net.TcpConn{
+		sock: sock
+		handle: sockfd
+		is_blocking: true
+	}
 }
 
 fn handle_udp_associate(mut client net.TcpConn, bind_ip string) ! {
@@ -368,8 +467,10 @@ fn handle_socks5(mut client net.TcpConn, bind_ip string) ! {
 		
 		client.write([u8(5), 0, 0, 1, 0, 0, 0, 0, 0, 0])!
 
-		spawn copy_data(mut client, mut target)
-		copy_data(mut target, mut client)
+		ch := chan bool{}
+		spawn copy_data_thread(client.sock.handle, target.sock.handle, 'ClientToTarget', ch)
+		spawn copy_data_thread(target.sock.handle, client.sock.handle, 'TargetToClient', ch)
+		_ = <-ch
 	} else if cmd == 3 {
 		handle_udp_associate(mut client, bind_ip)!
 	} else {
@@ -438,6 +539,7 @@ fn main() {
 
 	println('Starting SOCKS5 Multi-Gateway Proxy Tool...')
 	for target in targets {
+		setup_routing(target.bind_ip)
 		spawn start_gateway(target.local_port, target.bind_ip)
 	}
 
