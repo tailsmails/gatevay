@@ -30,7 +30,7 @@ fn C.close(sockfd int) int
 fn C.inet_pton(af int, src &char, dst voidptr) int
 fn C.strerror(errnum int) &char
 fn C.recv(sockfd int, buf voidptr, len int, flags int) int
-fn C.send(sockfd int, buf voidptr, len int, flags int) int
+// fn C.send(sockfd int, buf voidptr, len int, flags int) int
 
 struct Target {
 	bind_ip    string
