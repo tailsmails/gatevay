@@ -24,7 +24,7 @@ mut:
 
 fn C.socket(domain int, s_type int, protocol int) int
 // fn C.setsockopt(sockfd int, level int, optname int, optval voidptr, optlen int) int
-fn C.bind(sockfd int, addr voidptr, addrlen int) int
+// fn C.bind(sockfd int, addr voidptr, addrlen int) int
 fn C.connect(sockfd int, addr voidptr, addrlen int) int
 fn C.close(sockfd int) int
 fn C.inet_pton(af int, src &char, dst voidptr) int
